@@ -295,8 +295,8 @@ def save_results(results, params, output_dir = "output"):
             pl.col("SAR").quantile(0.975).alias("quantile_0.975_SAR"),
         ])
         print(agg_sar)
-        results["sar"].write_csv(os.path.join(f'{output_dir}sar.csv'))
-        agg_sar.write_csv(os.path.join(f'{output_dir}sar_summary.csv'))     
+        results["sar"].write_csv(os.path.join(f'{output_dir}/sar.csv'))
+        agg_sar.write_csv(os.path.join(f'{output_dir}/sar_summary.csv'))     
         (results["all_exposed_cases"]
          .write_csv(os.path.join(f'{output_dir}/all_exposed_cases.csv')))
     
