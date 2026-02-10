@@ -47,6 +47,225 @@ class Params:
     record_transmission: bool
     record_all_new_cases: bool
 
+def calculate_R0(p: Params):
+    
+    st = time.time()
+    p.hh_size_distribution = "constant"
+    p.hh_size = 100_000
+    
+    secondary_infections_from_seed_infection_list = []
+    exposed_by_seed_df = pl.DataFrame()
+    all_exposed_cases = pl.DataFrame()
+    rng = np.random.RandomState(p.random_seed)
+    ts = np.arange(p.time_step, p.time_horizon, p.time_step)    
+    transmission_rate = 1 - ((1 - p.transmission_rate)**(p.time_step))
+    inf_duration_gamma_scale = (p.inf_duration_gamma_mean/
+                                  p.inf_duration_gamma_shape)
+    
+    
+    1 - ((p.transmission_rate)**(p.time_step))
+    
+    
+    if p.hh_size_distribution != "constant":
+        hh_sizes = np.loadtxt("data/hh_sizes.csv", delimiter=",")
+        # Separate columns
+        hh_sizes_loaded = hh_sizes[:, 0].astype(int)       # as integer NumPy array
+        hh_size_prop_loaded = hh_sizes[:, 1]               # as float NumPy array
+        
+        # Optionally convert to Python lists
+        hh_sizes = hh_sizes_loaded.tolist()
+        hh_size_prop = hh_size_prop_loaded.tolist()
+
+        all_hh_sizes = rng.choice(hh_sizes, size = p.no_runs, 
+                                  p = hh_size_prop)
+    else:
+        all_hh_sizes = [p.hh_size] * p.no_runs
+    
+    if p.record_transmission:
+        possible_states = pl.DataFrame(
+           { "state": ["Susceptible", "Exposed", "Infectious", "Recovered"],
+            "count":  [0,0,0,0]}
+            )
+        all_records = pl.DataFrame()
+    
+    for run in range(p.no_runs):
+        secondary_infections_from_seed_infection = 0
+        cur_hh_size = all_hh_sizes[run]
+        # Initialize household
+        household = pl.DataFrame(
+        {
+        "id": range(cur_hh_size),
+        "state": ["Susceptible"] * cur_hh_size,
+        "s_time_exposed": [0.0] * cur_hh_size,
+        "s_time_infectious": [0.0] * cur_hh_size,
+        "s_time_recovery": [0.0] * cur_hh_size,
+        "exposed_from": [-1] * cur_hh_size,
+        "hh_size": cur_hh_size,
+        "hh_id": run,
+        "run_no": run,
+        }
+        )
+        #if p.record_transmission:
+        #    cur_records = pl.DataFrame()
+        
+        # Initialize household
+        cur_exposed_by_seed_df = pl.DataFrame()
+        #cur_all_exposed_cases = pl.DataFrame()
+        
+        # Infect one individual in the household (seed infection)
+        
+        # Calculate time until seed infection goes into the Recovered state
+        t_seed_recovery = rng.gamma(p.inf_duration_gamma_shape, 
+                                    inf_duration_gamma_scale)
+        
+        # Infect one individual in the household (seed infection)
+        seed_infection_index = 0#rng.randint(0, cur_hh_size - 1)
+        household = household.with_columns(
+        (pl.when(pl.col("id") == seed_infection_index)
+        .then(pl.lit("Infectious"))
+        .otherwise(pl.col("state"))).alias("state"),
+        
+        (pl.when(pl.col("id") == seed_infection_index)
+        .then(rng.gamma(p.inf_duration_gamma_shape, 
+                        inf_duration_gamma_scale))
+        .otherwise(pl.col("s_time_recovery"))).alias("s_time_recovery"),
+        )
+        
+        if p.record_transmission:
+            cur_records = possible_states.update(
+                household.group_by(pl.col("state")).agg(
+                pl.count()), on = ["state"], how = "left").with_columns(
+                    pl.lit(ts[0] - p.time_step).alias("t"))
+         
+        if p.record_all_new_cases:
+            cur_all_exposed_cases = household.filter(
+                            (pl.col("state") == "Infectious"))
+        
+        cur_exposed_by_seed_df = household.filter(
+                        (pl.col("state") == "Infectious"))
+        
+        
+        # Simulate transmission in the household
+        for t in ts:
+            infected_ids = household.filter(
+                pl.col("state") == "Infectious")["id"]
+            if not household.filter(
+                pl.col("state").is_in(["Infectious", "Exposed"])).height:
+                break
+            susceptible_individuals = household.filter(
+                pl.col("state") == "Susceptible")
+            will_infected_individuals = susceptible_individuals.with_columns(
+                 pl.Series(rng.rand(susceptible_individuals.height) 
+                     < (transmission_rate * len(infected_ids)))
+                 .alias("will_infected")
+                    ).filter(pl.col("will_infected")).drop("will_infected")
+            s_time_infectious = pl.Series("s_time_infectious", 
+                                t + rng.gamma(
+                                    p.inf_duration_gamma_shape, 
+                                    inf_duration_gamma_scale,
+                                    will_infected_individuals.height) ) 
+                                
+            will_infected_individuals = will_infected_individuals.with_columns(
+                pl.lit(t).alias("s_time_exposed"),
+                pl.lit(s_time_infectious).alias("s_time_infectious"),
+                pl.Series("s_time_recovery", 
+                        s_time_infectious + rng.gamma(
+                            p.inf_duration_gamma_shape, 
+                            inf_duration_gamma_scale,
+                            will_infected_individuals.height)),
+                pl.Series("exposed_from", 
+                         rng.choice(infected_ids, 
+                                    size = will_infected_individuals.height)),
+                pl.lit("Exposed").alias("state"),
+                )
+            
+            household = household.update(will_infected_individuals, 
+                                         on = "id", how= "left")
+            
+            #I -> R state transition
+            household = household.with_columns(
+                pl.when((pl.col("state") == "Infectious" ) & 
+                        ( pl.col("s_time_recovery") < t))
+                .then(pl.lit("Recovered")).otherwise(pl.col("state"))
+                .alias("state"),
+                )
+            
+            #E -> I state transition
+            household = household.with_columns(
+               pl.when((pl.col("state") == "Exposed" ) & 
+                       (pl.col("s_time_infectious") < t))
+                .then(pl.lit("Infectious")).otherwise(pl.col("state"))
+                .alias("state"),
+                )
+            
+            
+            new_infs_from_seed = household.filter(
+                            (pl.col("s_time_exposed") == t) &
+                             (pl.col("exposed_from") == seed_infection_index)
+                             )
+            if p.record_all_new_cases:
+                new_exposed_cases = household.filter(
+                                (pl.col("s_time_exposed") == t))
+                
+            cur_exposed_by_seed_df = cur_exposed_by_seed_df.vstack(new_infs_from_seed)
+            secondary_infections_from_seed_infection += new_infs_from_seed.height
+            
+            if p.record_all_new_cases:
+                #record all new exposed cases
+                cur_all_exposed_cases = cur_all_exposed_cases.vstack(new_exposed_cases)
+            #record transmissions
+            if p.record_transmission:
+                cur_records =  cur_records.vstack(possible_states.update(
+                    household.group_by(pl.col("state")).agg(
+                    pl.count()), on = ["state"], how = "left").with_columns(
+                        pl.lit(t).alias("t")))
+            
+        secondary_infections_from_seed_infection_list.append(secondary_infections_from_seed_infection)
+        if cur_exposed_by_seed_df.height:
+            #cur_exposed_by_seed_df = cur_exposed_by_seed_df.with_columns(
+            #    pl.Series("run_no", [run] * cur_exposed_by_seed_df.height))
+            exposed_by_seed_df = exposed_by_seed_df.vstack(cur_exposed_by_seed_df)
+        if p.record_all_new_cases and cur_all_exposed_cases.height:
+            #cur_all_exposed_cases = cur_all_exposed_cases.with_columns(
+            #    pl.Series("run_no", [run] * cur_all_exposed_cases.height))
+            all_exposed_cases = all_exposed_cases.vstack(cur_all_exposed_cases)
+        
+        
+        
+        if p.record_transmission:
+            all_records =  all_records.vstack(cur_records.with_columns(
+                pl.Series("run_no", [run] * cur_records.height),
+                ))
+    if p.record_all_new_cases:    
+        #calculate SAR
+        sar = all_exposed_cases.filter(pl.col("exposed_from") == 0).group_by(
+                    "run_no", "hh_id").agg(pl.count().alias("secondary_cases"), 
+                                           pl.col("hh_size").first(),
+                                SAR = pl.count()/(pl.col("hh_size").first() - 1))
+        all_sar = (all_exposed_cases.select(["run_no", "hh_id", "hh_size"])
+                   .unique().with_columns(pl.lit(0).alias("secondary_cases"),
+                                          pl.lit(0).alias("SAR"))
+                   .update(sar, on = ["run_no", "hh_id", "hh_size"], how = "left"))
+    
+    results = {"no_secondary_cases": secondary_infections_from_seed_infection_list, 
+               "hh_sizes": all_hh_sizes,
+                  "exposed_by_seed": exposed_by_seed_df,
+                  }
+    if p.record_transmission:
+        results["all_transmission"] = all_records
+
+    if p.record_all_new_cases:
+        results["all_exposed_cases"] = all_exposed_cases
+        results["sar"] = all_sar
+    
+    et = time.time()
+    # get the execution time
+    elapsed_time = et - st
+    print('Execution time:', elapsed_time, 'seconds')   
+        
+    return results
+
+
 
 def run_SEIR_model(p: Params):
     
@@ -370,38 +589,6 @@ def load_params(path: str | Path) -> Params:
 
 if __name__ == "__main__":
     
-    
-    #covid-like
-    params = Params(no_runs = 5000,
-                    hh_size = 5,
-                    #hh_size_distribution = "constant",
-                    hh_size_distribution = "distribution",
-                    inf_duration_gamma_mean = 7.68, 
-                    inf_duration_gamma_shape = 3,
-                    exposed_duration = 5.2,
-                    random_seed = 10,
-                    transmission_rate = 0.0165,#0.0164,#0.0276, 0.0268
-                    time_horizon = 80,
-                    time_step = 0.01,
-                    record_transmission= False,
-                    record_all_new_cases = True)
-    
-    
-    #another example
-    params = Params(no_runs = 20,
-                    hh_size = 500,
-                    hh_size_distribution = "constant",
-                    #hh_size_distribution = "distribution",
-                    inf_duration_gamma_mean = 3, 
-                    inf_duration_gamma_shape = 3,
-                    exposed_duration = 2,
-                    random_seed = 10,
-                    transmission_rate = 0.001,#0.0164,#0.0276, 0.0268
-                    time_horizon = 300,
-                    time_step = 1,
-                    record_transmission= True,
-                    record_all_new_cases = False)
-    
     params = load_params("data/covid_params.txt")
     print(params)
     
@@ -412,3 +599,4 @@ if __name__ == "__main__":
     
     #secondary_infections_from_seed_infection_list, exposed_by_seed_df, 
     #all_records = run_SEIR_model(params)
+    
